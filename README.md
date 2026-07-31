@@ -52,6 +52,22 @@ python scripts/inference.py --pdb backbone.pdb --ckpt checkpoints/vmm_ar_k8/late
 
 Only the backbone ($N, C_\alpha, C$) and sequence are used, so a **backbone-only PDB is a valid input**. The autoregressive head is unrolled by ancestral beam search to the top-$K$ joint $\chi$ modes; components with mixing weight above `--thresh` (default $0.10$) are written as altlocs A/B/C…, with sidechain atoms rebuilt from the predicted $\chi$ via NeRF. The checkpoint's architecture (including $k$) is inferred on load, so any trained run works. See `qfl_evaluation/benchmark/` for forward-pass latency benchmarking.
 
+### Confidence model
+
+`ConfidenceModel` scores a prediction *before* you have anything to compare it to: it predicts the per-residue $W_1$ (Å) between qFitLatent's $\chi$ mixture and the true qFit ensemble, from backbone and sequence alone. It is trained separately from the base model and is entirely optional — `inference.py` writes `<out>_confidence.csv` when a checkpoint is present and skips quietly when it isn't.
+
+```bash
+# 1. label: measure the real W1 of a frozen checkpoint's own predictions
+python scripts/make_w1_labels.py --ckpt checkpoints/vmm_ar_k8/latest.pt \
+    --out qfit_latent/data/w1_labels.csv
+
+# 2. train against those labels
+python scripts/train_confidence.py --w1_csv qfit_latent/data/w1_labels.csv \
+    --checkpoint_dir checkpoints/confidence
+```
+
+The model reuses qFitLatent's IPA trunk and swaps the $\chi$-mixture head for a small MLP (`ConfidenceHead`), AlphaFold-pLDDT style — there is no mixture to condition on, so it sees only the backbone frames and sequence. Regression is on $\log(1+W_1)$ under a smooth-L1 loss, which keeps a handful of very flexible, large-$W_1$ residues from dominating; `inference.py` `expm1`s the prediction back into Å. Because the targets come from a *frozen* base checkpoint's own predictions, the labels are specific to that checkpoint — rerunning `make_w1_labels.py` is required if the base model is retrained.
+
 ### Per-residue embeddings
 
 ```bash

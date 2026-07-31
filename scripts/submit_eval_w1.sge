@@ -1,0 +1,34 @@
+#!/bin/bash
+#$ -N eval_w1
+#$ -q gpu.q
+#$ -l gpu_mem=12G
+#$ -l mem_free=32G
+#$ -l h_vmem=128G
+#$ -l h_rt=04:00:00
+#$ -j y
+#$ -o $HOME/qFitLatent/logs/sge-$JOB_ID.out
+
+set -euo pipefail
+
+REPO_DIR="$HOME/qFitLatent"
+cd "$REPO_DIR"
+mkdir -p logs validation/w1_model_eval
+source .venv/bin/activate
+
+if [ -n "${SGE_GPU:-}" ]; then
+    export CUDA_VISIBLE_DEVICES="$SGE_GPU"
+fi
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+# predicted vs true per-residue W1 on the 99 held-out val proteins.
+# ground truth = w1_labels.csv (measured from the same frozen vmm_ar_k8
+# ensembles the confidence model was trained against; val contributed
+# validation loss only, no gradients).
+python3 validation/eval_w1_model.py                       \
+    --compare_ckpts                                       \
+        checkpoints/confidence/epoch_0060.pt              \
+        checkpoints/confidence/epoch_0200.pt              \
+    --val_csv        qfit_latent/data/val_subset.csv      \
+    --structures_dir ../qfit_data/structures              \
+    --w1_csv         qfit_latent/data/w1_labels.csv       \
+    --out            validation/w1_model_eval

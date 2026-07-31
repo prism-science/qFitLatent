@@ -113,6 +113,48 @@ class qFitDataset(Dataset):
     def __getitem__(self, idx):
         return ground_truth(self.paths[idx], max_len = self.max_len)
 
+class ConfidenceDataset(Dataset):
+    '''
+    Dataset for the confidence model: same backbone+sequence input features
+    as qFitDataset, paired with per-residue W1 labels (the Wasserstein
+    distance between qFitLatent's predicted chi mixture and the true qFit
+    ensemble) precomputed by scripts/make_w1_labels.py.
+    '''
+    def __init__(self, paths, w1_table, max_len=None):
+        self.paths = list(paths)
+        self.w1_table = w1_table
+        self.max_len = max_len
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, idx):
+        path = self.paths[idx]
+        gt = ground_truth(path, max_len=self.max_len)
+        if gt is None:
+            return None
+        keys = sorted(parse_pdb(path))
+        labels = self.w1_table.get(path.stem.lower(), {})
+        w1 = torch.tensor(
+            [labels.get(key, float("nan")) for key in keys], dtype=torch.float32
+        )
+        if not torch.isfinite(w1).any():
+            return None
+        return {"aa_tokens": gt["aa_tokens"], "R": gt["R"], "t": gt["t"], "w1": w1}
+
+
+def load_w1_table(csv_path):
+    '''
+    Load scripts/make_w1_labels.py's output: pdb -> {(chain, seq): w1}
+    '''
+    table = {}
+    with open(csv_path) as fh:
+        for row in csv.DictReader(fh):
+            key = (row["chain"], int(row["seq"]))
+            table.setdefault(row["pdb"].lower(), {})[key] = float(row["w1"])
+    return table
+
+
 def ground_truth(path, max_len):
     '''
     Get the ground truth altloc information from the qfit multiconformer model
@@ -140,7 +182,7 @@ def ground_truth(path, max_len):
         c_xyz = get_xyz(altlocs, "C") # bb carbon of first altloc 
         n_xyz = get_xyz(altlocs, "N") # alpha carbon of first altloc 
 
-        t[i] = ca_xyz # frame translation vector
+        t[i] = ca_xyz if ca_xyz is not None else 0.0 # frame translation vector
 
         # if missing a backbone atom skip otherwise build R rotation matrix
         if n_xyz is None or c_xyz is None or ca_xyz is None:

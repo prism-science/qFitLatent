@@ -9,6 +9,7 @@ von mises mixture model in torsional space.
 
 import torch.nn as nn
 import torch
+import torch.nn.functional as F
 import math
 
 from .data.data import N_CHI_PER_AA
@@ -99,6 +100,34 @@ class ChiARLoss(nn.Module):
 
         return out
     
+class ConfidenceLoss(nn.Module):
+    '''
+    Smooth-L1 regression loss for ConfidenceModel: predicts log1p(W1), the
+    Wasserstein distance (A) between qFitLatent's predicted chi mixture and
+    the true qFit ensemble. log space keeps a few very flexible (large-W1)
+    residues from dominating the loss.
+
+    Inputs:
+        pred_log_w1: [N]  model output, log1p(W1) prediction
+        w1_target:   [N]  real W1 (A); nan where no label (< 2 altlocs)
+    '''
+    def forward(self, pred_log_w1, w1_target):
+        out = {
+            "loss": pred_log_w1.new_zeros(()),
+            "per_residue_loss": torch.full_like(pred_log_w1, float("nan")),
+        }
+        valid = torch.isfinite(w1_target)
+        if not valid.any():
+            return out
+
+        target_log = torch.log1p(w1_target[valid].clamp(min=0))
+        per_res = F.smooth_l1_loss(pred_log_w1[valid], target_log, reduction="none")
+
+        out["loss"] = per_res.mean()
+        out["per_residue_loss"][valid] = per_res.detach()
+        return out
+
+
 # chi angles are symmetric about 2pi so the distances need to wrap
 def wrap_2pi(x):
     return torch.atan2(torch.sin(x), torch.cos(x))

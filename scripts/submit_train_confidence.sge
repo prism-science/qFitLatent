@@ -1,0 +1,61 @@
+#!/bin/bash
+#$ -N train_confidence
+#$ -q gpu.q
+#$ -l gpu_mem=12G
+#$ -l mem_free=32G
+#$ -l h_vmem=128G
+#$ -l h_rt=23:00:00
+#$ -j y
+#$ -o $HOME/qFitLatent/logs/sge-$JOB_ID.out
+
+set -euo pipefail
+
+REPO_DIR="$HOME/qFitLatent"
+DATA_DIR="$HOME/qfit_data/structures"
+TRAIN_SUBSET="$REPO_DIR/qfit_latent/data/train_subset.csv"
+VAL_SUBSET="$REPO_DIR/qfit_latent/data/val_subset.csv"
+BASE_CKPT="$REPO_DIR/checkpoints/vmm_ar_k8/latest.pt"
+W1_LABELS="$REPO_DIR/qfit_latent/data/w1_labels.csv"
+
+cd "$REPO_DIR"
+mkdir -p logs checkpoints
+source .venv/bin/activate
+
+if [ -n "${SGE_GPU:-}" ]; then
+    export CUDA_VISIBLE_DEVICES="$SGE_GPU"
+fi
+if [ -z "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    echo "ERROR: CUDA_VISIBLE_DEVICES not set (SGE_GPU=${SGE_GPU:-unset})."
+    exit 1
+fi
+
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+# label generation is CPU-bound (forward pass on the frozen base model + a
+# W1 solve per residue) -- cache it so a resubmitted/resumed job skips it
+if [ ! -s "$W1_LABELS" ]; then
+    python3 scripts/make_w1_labels.py \
+        --ckpt "$BASE_CKPT" \
+        --train_csv "$TRAIN_SUBSET" \
+        --val_csv   "$VAL_SUBSET"   \
+        --structures_dir "$DATA_DIR" \
+        --out "$W1_LABELS"
+fi
+
+# confidence model: same trunk/input features as vmm_ar_k8, predicts log1p(W1)
+python3 scripts/train_confidence.py       \
+    --structures_dir "$DATA_DIR"          \
+    --train_csv "$TRAIN_SUBSET"           \
+    --val_csv   "$VAL_SUBSET"             \
+    --w1_csv    "$W1_LABELS"              \
+    --epochs        200                   \
+    --lr            3e-4                  \
+    --d_single      128                   \
+    --d_pair        32                    \
+    --n_ipa         8                     \
+    --n_heads       4                     \
+    --c             8                     \
+    --dropout       0.2                   \
+    --save_every    10                    \
+    --checkpoint_dir checkpoints/confidence \
+    --loss_csv       logs/confidence.csv

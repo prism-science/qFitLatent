@@ -136,6 +136,47 @@ class qFitLatent(nn.Module):
         return self.chi_head.predict(s, chi_mask, K=K)
 
 
+class ConfidenceModel(qFitLatent):
+    '''
+    Predicts per-residue confidence for a qFitLatent checkpoint: how far (in
+    A, Wasserstein distance) its predicted chi mixture is likely to land from
+    the true qFit conformer ensemble -- trained separately, in addition to
+    the base model, against W1 labels computed from a frozen checkpoint's own
+    predictions (scripts/make_w1_labels.py). Same backbone + sequence input
+    and IPA trunk as qFitLatent (AlphaFold-pLDDT style confidence head, just
+    without a chi mixture to condition on).
+    '''
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        del self.chi_head  # confidence head replaces the chi mixture head
+        self.conf_head = ConfidenceHead(self.d_s)
+
+    # aa_tokens: (N); R: (N,3,3); t: (N,3) -> pred_log_w1: (N,)
+    def forward(self, aa_tokens, R, t):
+        s = self.aa_embed(aa_tokens)
+        z = self.pair_init(s, t)
+        for block in self.ipa_blocks:
+            if self.training:
+                s, z = _checkpoint(block, s, z, R, t, use_reentrant=False)
+            else:
+                s, z = block(s, z, R, t)
+        return self.conf_head(s)
+
+
+class ConfidenceHead(nn.Module):
+    ''' Small MLP predicting a scalar per-residue target from the single rep s. '''
+    def __init__(self, d_single, d_hidden=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_single, d_hidden),
+            nn.SiLU(),
+            nn.Linear(d_hidden, 1),
+        )
+
+    def forward(self, s):
+        return self.net(s).squeeze(-1)  # (N,)
+
+
 class ChiARHead(nn.Module):
     '''
     Autoregressive von Mises mixture over the four sidechain chi angles.

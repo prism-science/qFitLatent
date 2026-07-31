@@ -28,8 +28,9 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))    # qFitLatent package
 
 DEFAULT_CKPT = ROOT / "checkpoints/vmm_ar_k8/latest.pt"
+DEFAULT_CONFIDENCE_CKPT = ROOT / "checkpoints/confidence/latest.pt"
 
-from qfit_latent.model import qFitLatent
+from qfit_latent.model import qFitLatent, ConfidenceModel
 from qfit_latent.data.data import parse_pdb, get_xyz
 
 # ── constants ──────────────────────────────────────────────────────────────────
@@ -282,6 +283,40 @@ def load_model(ckpt_path: Path, device: str) -> qFitLatent:
     return model.eval().to(device)
 
 
+def load_confidence_model(ckpt_path: Path, device: str) -> ConfidenceModel:
+    """
+    Rebuild a ConfidenceModel the same way load_model() rebuilds a qFitLatent
+    — hyperparameters inferred from the checkpoint's state dict.
+    """
+    sd  = torch.load(ckpt_path, map_location="cpu")["model"]
+    d_s = sd["aa_embed.weight"].shape[1]
+    d_z = sd["rel_pos_embed.weight"].shape[1]
+    H   = sd["ipa_blocks.0.ipa.head_weight"].shape[0]
+    c   = sd["ipa_blocks.0.ipa.q_s.weight"].shape[0] // H
+    n_ipa = 1 + max(int(k.split(".")[1]) for k in sd if k.startswith("ipa_blocks."))
+    model = ConfidenceModel(d_single=d_s, d_pair=d_z, n_heads=H, c=c, n_ipa=n_ipa)
+    model.load_state_dict(sd)
+    return model.eval().to(device)
+
+
+@torch.no_grad()
+def run_confidence(
+    model: ConfidenceModel, sample: dict, device: str,
+) -> torch.Tensor:
+    """
+    Forward pass: returns predicted per-residue W1 (Å) — the confidence
+    model's estimate of how far qFitLatent's chi-mixture prediction will land
+    from the true qFit ensemble, expm1'd back out of the log1p space it was
+    trained in.
+    """
+    pred_log_w1 = model(
+        sample["aa_tokens"].to(device),
+        sample["R"].to(device),
+        sample["t"].to(device),
+    )
+    return torch.expm1(pred_log_w1).clamp(min=0).cpu()
+
+
 @torch.no_grad()
 def run_inference(
     model: qFitLatent, sample: dict, device: str, K: int = 8, to_cpu: bool = True,
@@ -389,6 +424,27 @@ def write_predicted_pdb(
     path.write_text("".join(lines) + "END\n")
 
 
+def write_confidence_csv(
+    path: Path, pdb_path: Path, sample: dict, pred_w1: torch.Tensor,
+) -> None:
+    """
+    Per-residue confidence, one row per residue in `sample`: the predicted W1
+    (Å) between this prediction and the true qFit ensemble.
+    """
+    import csv
+    records = parse_pdb(pdb_path)
+    keys    = sorted(records)
+    aa      = sample["aa_tokens"].numpy()
+    with open(path, "w", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["chain", "seq", "resname", "pred_w1"])
+        for i, (chain_id, resseq) in enumerate(keys):
+            writer.writerow(
+                [chain_id, resseq, AA_IDX.get(int(aa[i]), "UNK"),
+                 f"{float(pred_w1[i]):.4f}"]
+            )
+
+
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
 def main():
@@ -404,6 +460,11 @@ def main():
                     help="Min mixing weight to write as altloc (default: 0.10)")
     ap.add_argument("--K",      type=int, default=8,
                     help="Number of joint chi modes to predict (default: 8)")
+    ap.add_argument("--confidence_ckpt", type=Path, default=DEFAULT_CONFIDENCE_CKPT,
+                    help="Confidence-model checkpoint predicting per-residue "
+                         f"W1 (default: {DEFAULT_CONFIDENCE_CKPT}; skipped if absent)")
+    ap.add_argument("--no_confidence", action="store_true",
+                    help="Skip the confidence prediction even if the checkpoint exists")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu",
                     help="Torch device (default: cuda if available else cpu)")
     args = ap.parse_args()
@@ -423,6 +484,16 @@ def main():
     out = args.out or args.pdb.parent / f"{args.pdb.stem}_predicted.pdb"
     write_predicted_pdb(out, args.pdb, sample, pi, mu, kappa, pi_thresh=args.thresh)
     print(f"wrote → {out}  ({pi.shape[0]} residues)")
+
+    # The confidence model (scripts/train_confidence.py) — how far (Å) is this
+    # prediction likely to be from the true qFit ensemble? Trained separately
+    # from the base model, so it is skipped quietly if there is no checkpoint.
+    if not args.no_confidence and args.confidence_ckpt.exists():
+        conf_model = load_confidence_model(args.confidence_ckpt, device)
+        pred_w1 = run_confidence(conf_model, sample, device)
+        conf_out = out.parent / f"{out.stem}_confidence.csv"
+        write_confidence_csv(conf_out, args.pdb, sample, pred_w1)
+        print(f"wrote → {conf_out}  (mean predicted W1 = {pred_w1.mean():.3f} Å)")
 
 
 if __name__ == "__main__":
