@@ -1,83 +1,93 @@
 # qFitLatent
 
-SE(3)-invariant model that predicts per-residue sidechain torsion distributions from backbone structure and sequence, trained on qFit multiconformer crystal structures.
+A variational autoencoder for qFit multiconformer crystal structures. It compresses each residue's observed side-chain ensemble (altlocs and occupancies) into a small SE(3)-invariant latent and reconstructs that ensemble as a distribution over χ angles. The per-residue latent mean $\mu_z$ is a **dynamics representation**: it is learned from the conformational heterogeneity in experimental density, for use in downstream models.
 
 ---
 
 ## Architecture
 
-### Inputs
+### Inputs (per residue, `qfitlatent/featurize.py`)
 
 | Symbol | Shape | Description |
 |--------|-------|-------------|
-| $a_i$ | $(N,)$ | amino acid tokens, $a_i \in \{0, \ldots, 20\}$ |
-| $R_i$ | $(N, 3, 3)$ | backbone rotation matrix (to local frame, primary altloc) |
-| $t_i$ | $(N, 3)$ | $C_\alpha$ position (frame origin) |
+| $a_i$ | $(N,)$ | amino acid token, $a_i \in \{0, \ldots, 20\}$ |
+| $R_i, t_i$ | $(N, 3, 3), (N, 3)$ | backbone frame from $N, C_\alpha, C$ of the dominant altloc |
+| $\phi_i, \psi_i$ | $(N,)$ | backbone dihedrals |
+| $\chi_{ia}, o_{ia}$ | $(N, 6, 4), (N, 6)$ | up to 6 altlocs: $\sin/\cos$ of 4 χ angles + occupancy |
 
-Local frames are constructed from $N$, $C_\alpha$, $C$ atoms of the primary (blank) altloc:
+### Model (`qfitlatent/model.py`)
 
-$$\hat{x} = \frac{C - C_\alpha}{\| C - C_\alpha \|}, \quad \hat{z} = \frac{\hat{x} \times (N - C_\alpha)}{\| \hat{x} \times (N - C_\alpha) \|}, \quad \hat{y} = \hat{z} \times \hat{x}$$
+- **Ensemble encoder.** A set transformer over each residue's altloc tokens: self-attention, then attention pooling with 4 learned seeds. It is permutation invariant across altlocs. Hidden or unmodeled residues get a learned mask token.
+- **Trunk.** The single track is the aa embedding plus the ensemble code ($d_s = 256$). The pair track holds relative position, $C_\alpha$–$C_\alpha$ distance and the outer product ($d_z = 64$). These feed 8 IPA blocks with triangle updates.
+- **Bottleneck.** A per-residue Gaussian latent $z \in \mathbb{R}^{32}$, sampled in training and set to $\mu_z$ at inference.
+- **Decoder** (`direct_head.py`). From $z$, the aa embedding and $\sin/\cos(\phi, \psi)$, it predicts a $K = 16$ von Mises mixture over the χ torus:
 
-so that $R_i = [\hat{x} \; \hat{y} \; \hat{z}]$ is a proper orthonormal frame that puts the $C_\alpha$ at the origin, the $C$ along the positive x-axis, and the $N$ in the xy-plane with positive y.
+$$p(\chi_i \mid z_i) = \sum_{k=1}^{K} w_{ik} \prod_{d=1}^{D_i} \mathrm{vM}\!\left(\chi_{d} \mid \mu_{ikd}, \kappa_{ikd}\right)$$
 
-### Output head (autoregressive von Mises mixture)
+### Loss (`qfitlatent/losses.py`)
 
-The final single representation $s_i$ conditions an **autoregressive** chain over the four sidechain $\chi$ angles. Each $\chi_d$ has its own $k$-component von Mises mixture whose parameters depend on $s_i$ **and** the previous angles $\chi_{\lt d}$ (fed in as $\sin/\cos$ features):
+During training, 15% of residues are hidden and must be reconstructed from context:
 
-$$p(\chi_i \mid s_i) = \prod_{d=1}^{D_\chi} \sum_{k=1}^{K} \pi_{dk}(s_i, \chi_{\lt d})\; \mathrm{vM}\!\left(\chi_d \mid \mu_{dk}, \kappa_{dk}\right)$$
+$$\mathcal{L} = \mathrm{NLL}_{\mathrm{all}} + \beta\,\mathrm{KL} + \lambda_H H(w) + \lambda_{\mathrm{OT}}\,\mathrm{OT} + \lambda_{\mathrm{occ}}\,\mathrm{OCC} + \lambda_m \mathrm{NLL}_{\mathrm{masked}}$$
 
-with $D_\chi = 4$ and, per head, $\pi = \mathrm{softmax}(\cdot)$, $\mu = \pi\tanh(\cdot) \in (-\pi, \pi]$, $\kappa = \mathrm{softplus}(\cdot) + \kappa_{\min} \gt 0$ (the circular analogue of inverse variance). A single rotameric mode is therefore a *sequence* of component choices $(k_1, \ldots, k_4)$, so one mode can natively express correlated $\chi$ (e.g. ARG $g^+/g^+/t/g^+$) — unlike the earlier factorised mixture, whose components used independent per-$\chi$ parameters. The von Mises form (replacing an earlier wrapped Gaussian) removes the variance-floor hack and gives a properly normalized density on the torus.
+- **NLL:** the occupancy-weighted mixture NLL of the observed altlocs. π-symmetric χ are folded.
+- **KL:** the term against $\mathcal{N}(0, I)$.
+- **$H(w)$:** mixture-weight entropy.
+- **OT:** Sinkhorn transport between modes and altlocs on the torus.
+- **OCC:** matching mode weights to altloc occupancies.
+
+---
+
+## Installation
+
+```bash
+pip install -r requirements.txt
+```
 
 ---
 
 ## Training
 
-**Data.** qFit multiconformer PDB files. Named altlocs (A, B, $\ldots$) with crystallographic occupancies provide the discrete ground-truth ensemble; the blank altloc provides the input backbone frame.
+Training takes qFit multiconformer PDBs, given as a directory or as list files with one path per line.
 
-**Loss.** Occupancy-weighted negative log-likelihood of the observed altloc $\chi$ angles, with the density factored autoregressively and **teacher-forced**: the conditioning $\chi_{a,\lt d}$ at step $d$ uses altloc $a$'s own observed earlier angles. For a single residue with $A$ observed altlocs:
+```bash
+# optional: fetch canonical sequences from RCSB so unmodeled residues are placed correctly
+python scripts/fetch_sequences.py --structures-dir data/structures
 
-$$\mathcal{L} = - \sum_{a=1}^{A} o_a \sum_{d=1}^{D} \log \sum_{k=1}^{K} \pi_{dk}(\chi_{a,\lt d})\, \mathrm{vM}\!\left(\chi_{ad} \mid \mu_{dk}, \kappa_{dk}\right), \qquad \mathrm{vM}(\chi \mid \mu, \kappa) = \frac{\exp(\kappa \cos(\chi - \mu))}{2\pi I_0(\kappa)}$$
+python scripts/train.py --train-list train.txt --val-list val.txt \
+  --d-latent 32 --beta 0.02 --entropy 0.3 --sinkhorn 1.0 --occ-match 5 \
+  --mask-frac 0.15 --val-mask-frac 0.15 --epochs 12 --kl-warmup 2 \
+  --checkpoint runs/model.pt --log runs/model.csv
+```
 
-averaged over the valid residue set $\mathcal{R} = \{ i : n_{\mathrm{obs},i} \geq 2,\ d_{\mathrm{eff},i} \geq 1 \}$ (at least two observed altlocs and one defined $\chi$). Here $o_a$ is the normalized occupancy ($\sum_a o_a = 1$), $D$ the number of defined $\chi$ for the residue (per-$\chi$ validity mask), and $I_0$ the order-0 modified Bessel function — its log-normalizer is evaluated stably as $\log I_0(\kappa) = \log\,\mathrm{i0e}(\kappa) + \kappa$ (`torch.special.i0e`). The residual $\chi_{ad} - \mu_{dk}$ is taken on the circle; for $\pi$-symmetric $\chi$ (ASP $\chi_2$, GLU $\chi_3$, PHE $\chi_2$, TYR $\chi_2$) it is folded to $(-\pi/2, \pi/2]$ via $\tfrac{1}{2}\,\mathrm{atan2}(\sin 2\Delta, \cos 2\Delta)$.
+The released model was trained in two parts:
 
-**Optimization.** AdamW with $\eta = 3 \times 10^{-4}$, cosine annealing to $\eta / 100$ over the full training run. Batch size 1 (one full protein per step).
+1. 12 epochs from scratch with the command above.
+2. Three 4-epoch stages, each warm-started from the previous one with `--init-from <checkpoint> --masked-weight 1 --epochs 4 --kl-warmup 1`.
+
+Use `--cache-dir` to cache features and `--workers` to featurize in parallel. A GPU is recommended. The best validation epoch is saved as `runs/model.best.pt`.
 
 ---
 
-## Inference
+## Inference: extract embeddings
 
 ```bash
-python scripts/inference.py --pdb backbone.pdb --ckpt checkpoints/vmm_ar_k8/latest.pt --out pred.pdb
+python scripts/extract_embeddings.py --checkpoint runs/model.best.pt --pdb 1abc.pdb --out embeddings/
 ```
 
-Only the backbone ($N, C_\alpha, C$) and sequence are used, so a **backbone-only PDB is a valid input**. The autoregressive head is unrolled by ancestral beam search to the top-$K$ joint $\chi$ modes; components with mixing weight above `--thresh` (default $0.10$) are written as altlocs A/B/C…, with sidechain atoms rebuilt from the predicted $\chi$ via NeRF. The checkpoint's architecture (including $k$) is inferred on load, so any trained run works. See `qfl_evaluation/benchmark/` for forward-pass latency benchmarking.
+The input is a qFit multiconformer PDB. Every chain is encoded with its altloc ensembles visible. The script writes `embeddings/1abc.npz` with these aligned per-residue arrays:
 
-### Per-residue embeddings
+| key | shape | description |
+|-----|-------|-------------|
+| `emb` | $[N, 32]$ | latent mean $\mu_z$ (the dynamics embedding) |
+| `logvar` | $[N, 32]$ | latent log-variance |
+| `chain`, `resseq`, `resname` | $[N]$ | residue identity (`resseq = -1` for unmodeled positions) |
+| `aa_token`, `resolved` | $[N]$ | amino acid token and whether the residue is modeled |
 
-```bash
-python scripts/extract_embeddings.py --pdb backbone.pdb --ckpt checkpoints/vmm_ar_k8/latest.pt --out emb.npz
+If `--seq-dir` holds the chain's canonical sequence from `fetch_sequences.py`, unmodeled positions are included and encoded from context. Otherwise only the modeled residues are used. The same is available from Python:
+
+```python
+from qfitlatent.inference import load_model, embed_pdb
+model = load_model("runs/model.best.pt")
+arrays = embed_pdb(model, "1abc.pdb")
 ```
-
-Writes the single representation $s_i$ from the final IPA block — the SE(3)-invariant per-residue vector the chi head reads — as an `.npz` with `emb` $[N, d_s]$ plus aligned `chain` / `resseq` / `resname` / `aa_token` arrays. Load with `np.load(..., allow_pickle=True)`.
-
----
-
-## Default hyperparameters
-
-| Parameter | Symbol | Value |
-|-----------|--------|-------|
-| single representation | $d_s$ | $128$ |
-| pair representation | $d_z$ | $32$ |
-| IPA blocks | $L$ | $8$ |
-| attention heads | $H$ | $4$ |
-| head dim | $c$ | $8$ |
-| query/key points | $N_{qk}$ | $4$ |
-| value points | $N_v$ | $8$ |
-| von Mises components | $k$ | $5$ |
-| chi dimensions | $D_\chi$ | $4$ |
-| concentration floor | $\kappa_{\min}$ | $0.01$ |
-| dropout | $p$ | $0.2$ |
-| optimizer | --- | AdamW |
-| learning rate | $\eta$ | $3 \times 10^{-4}$ |
-| schedule | --- | cosine to $\eta / 100$ |
-| batch size | --- | $1$ |

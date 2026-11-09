@@ -12,3 +12,11 @@ select_subsets.py
 *.csv
 *.json
 *.png
+
+# data, runs and outputs
+data/
+runs/
+external/
+embeddings/
+*.pt
+*.npz
