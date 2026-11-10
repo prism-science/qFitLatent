@@ -8,6 +8,10 @@ scripts/fetch_sequences.py. Every canonical position gets an amino-acid token;
 resolved positions also get an AF-style rigid frame (R, t) and qFit chi
 angles/occupancies per altloc. Unresolved positions get identity R, zero t,
 resolved_mask = False.
+
+Altloc letters only tell a residue's conformers apart, so the backbone (frame,
+phi/psi) is always read from the residue's highest-occupancy altloc, and the
+altlocs are ordered by occupancy.
 '''
 
 import argparse
@@ -85,6 +89,17 @@ def _coord(res, name, alt):
         if m.any():
             return res.coord[m][0]
     return None
+
+
+def top_altloc(res):
+    '''The residue's highest-occupancy altloc id (" " when it has none). Letters only
+    distinguish conformers, so ties go to the first letter.'''
+    best, best_occ = " ", -1.0
+    for alt in sorted(set(res.altloc_id) - {" ", ""}):
+        occ = float(res.occupancy[res.altloc_id == alt].max())
+        if occ > best_occ:
+            best, best_occ = alt, occ
+    return best
 
 
 def _chi_and_occ(res):
@@ -204,7 +219,8 @@ def featurize_chain(chain, canonical, return_context=False):
         if oi is None:
             continue
         res = residues[oi]
-        n, ca, cc = (_coord(res, a, "A") for a in ("N", "CA", "C"))
+        alt = top_altloc(res)
+        n, ca, cc = (_coord(res, a, alt) for a in ("N", "CA", "C"))
         if ca is not None:
             t[ci] = ca
         if n is not None and ca is not None and cc is not None:
