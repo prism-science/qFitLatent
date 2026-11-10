@@ -11,9 +11,10 @@ in total, so the sequence and spatial strategies differ only in the distance use
 Clusters are added until the chain's budget of `mask_frac` of its scored residues is
 spent, and may overlap and merge. The cluster size does not depend on `mask_frac`.
 
-featurize.py leaves residues with no altloc A at the origin (t = 0), so for the
-spatial strategy their position is interpolated along the chain; otherwise they
-would all count as each other's neighbours.
+featurize.py reads the backbone from each residue's highest-occupancy altloc, but
+a residue with no CA at all is left at the origin (t = 0), so for the spatial
+strategy its position is interpolated along the chain; otherwise all such residues
+would count as each other's neighbours.
 '''
 
 import numpy as np
